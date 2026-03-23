@@ -141,7 +141,7 @@ then
     exit 1
 fi
 
-pip install -q transformers peft datasets accelerate bitsandbytes trl \
+pip install -q transformers peft datasets accelerate trl \
                matplotlib pandas numpy
 
 # ── Run benchmark ────────────────────────────────────────────────────────────

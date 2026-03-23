@@ -4,7 +4,7 @@ A portable benchmark for measuring LoRA fine-tuning throughput across different 
 
 ## What it measures
 
-Training speed (tokens/second) for a ~7B parameter model using LoRA fine-tuning on the [yahma/alpaca-cleaned](https://huggingface.co/datasets/yahma/alpaca-cleaned) instruction dataset. It automatically uses QLoRA (4-bit) on GPUs with less than 30 GB VRAM, and full BF16 LoRA on larger cards.
+Training speed (tokens/second) for a ~7B parameter model using LoRA fine-tuning on the [yahma/alpaca-cleaned](https://huggingface.co/datasets/yahma/alpaca-cleaned) instruction dataset.
 
 The benchmark runs 5 warmup steps followed by 50 timed steps, then reports mean, median, peak, and wall-clock throughput, plus projected training time for a 500M token corpus.
 
@@ -56,7 +56,7 @@ Each run produces a `results_<machine>.json` with the following fields:
 | `wall_tps` | Total tokens divided by total elapsed time - the most realistic number for estimating real training duration |
 | `vram_total_gb` | Total VRAM on the GPU |
 | `vram_peak_gb` | Peak VRAM actually used during the run - if this is close to total, you're near the memory limit |
-| `precision` | `bf16` = full LoRA, `qlora_4bit` = 4-bit quantised (used automatically on GPUs with <30 GB VRAM) |
+| `precision` | Training dtype: `bf16`, `fp16`, or `fp32` |
 | `epoch_hours` | Projected hours to train one pass over a 500M token corpus at `wall_tps` |
 | `five_epoch_days` | Same projection for five epochs |
 | `param_gb` | Total model parameter footprint in GB at the training dtype (e.g. 14 GB for a 7B model in BF16). Useful for sanity-checking `vram_peak_gb` and for estimating memory traffic |

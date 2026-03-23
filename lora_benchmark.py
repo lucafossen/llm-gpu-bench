@@ -163,23 +163,13 @@ class _GPUSampler:
 # ── Model loading ─────────────────────────────────────────────────────────────
 
 def load_model(args, info: dict, devices: list):
-    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     from peft import LoraConfig, get_peft_model
 
     torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
 
     vram_gb = info["vram_gb"]
-    use_qlora = vram_gb > 0 and vram_gb < 30
-    print(f"VRAM: {vram_gb} GB  ->  {'QLoRA (4-bit)' if use_qlora else 'LoRA (' + args.dtype.upper() + ')'}")
-
-    bnb_config = None
-    if use_qlora:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch_dtype,
-            bnb_4bit_use_double_quant=True,
-        )
+    print(f"VRAM: {vram_gb} GB  ->  LoRA ({args.dtype.upper()})")
 
     print(f"Loading {args.model_id} ...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -208,8 +198,7 @@ def load_model(args, info: dict, devices: list):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         token=args.hf_token,
-        dtype=torch_dtype if not use_qlora else None,
-        quantization_config=bnb_config,
+        dtype=torch_dtype,
         device_map=_device_map,
         max_memory=_max_memory,
         attn_implementation="sdpa",
@@ -229,7 +218,7 @@ def load_model(args, info: dict, devices: list):
     )
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
-    return model, tokenizer, use_qlora
+    return model, tokenizer
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -349,7 +338,7 @@ def run_benchmark(args, model, dataset, devices: list):
 
 # ── Results ───────────────────────────────────────────────────────────────────
 
-def summarise(args, info: dict, use_qlora: bool,
+def summarise(args, info: dict,
               step_times, bench_tokens, bench_wall, gpu_samples: dict, param_bytes: int,
               devices: list):
     tokens_per_step = args.batch_size * args.max_seq_len
@@ -388,7 +377,7 @@ def summarise(args, info: dict, use_qlora: bool,
     print(f"  GPU:                 {info['gpu']}")
     print(f"  VRAM total:          {info['vram_gb']} GB")
     print(f"  VRAM peak (used):    {vram_peak_gb:.1f} GB")
-    print(f"  Precision:           {'QLoRA (4-bit)' if use_qlora else args.dtype.upper()}")
+    print(f"  Precision:           {args.dtype.upper()}")
     print(f"  Seq len / batch:     {args.max_seq_len} / {args.batch_size}")
     print(f"  LoRA rank:           {args.lora_rank}")
     print()
@@ -453,7 +442,7 @@ def save_plot(args, info: dict, metrics: dict):
 
 # ── JSON export ───────────────────────────────────────────────────────────────
 
-def save_json(args, info: dict, use_qlora: bool, metrics: dict):
+def save_json(args, info: dict, metrics: dict):
     safe_label = args.machine_label.replace(" ", "_")
     fname = f"results_{safe_label}.json"
     results = {
@@ -463,7 +452,7 @@ def save_json(args, info: dict, use_qlora: bool, metrics: dict):
         "gpu":             info["gpu"],
         "vram_total_gb":   info["vram_gb"],
         "vram_peak_gb":    round(metrics["vram_peak_gb"], 2),
-        "precision":       "qlora_4bit" if use_qlora else args.dtype,
+        "precision":       args.dtype,
         "lora_rank":       args.lora_rank,
         "seq_len":         args.max_seq_len,
         "batch_size":      args.batch_size,
@@ -502,12 +491,12 @@ def main():
     info = gpu_info(args.machine_label, devices)
     print(json.dumps(info, indent=2))
 
-    model, tokenizer, use_qlora = load_model(args, info, devices)
+    model, tokenizer = load_model(args, info, devices)
     dataset = load_data(args, tokenizer)
     step_times, bench_tokens, bench_wall, gpu_samples, param_bytes = run_benchmark(args, model, dataset, devices)
-    metrics = summarise(args, info, use_qlora, step_times, bench_tokens, bench_wall, gpu_samples, param_bytes, devices)
+    metrics = summarise(args, info, step_times, bench_tokens, bench_wall, gpu_samples, param_bytes, devices)
     save_plot(args, info, metrics)
-    save_json(args, info, use_qlora, metrics)
+    save_json(args, info, metrics)
 
 
 if __name__ == "__main__":
