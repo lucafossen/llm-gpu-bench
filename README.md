@@ -1,4 +1,4 @@
-# lora-benchmark
+# llm-gpu-bench
 
 A portable benchmark for measuring LoRA fine-tuning throughput across different GPU hardware. Run it on a machine, get a JSON report and a plot back.
 
@@ -11,7 +11,7 @@ The benchmark runs 5 warmup steps followed by 50 timed steps, then reports mean,
 ## Usage
 
 ```bash
-git clone https://github.com/lucafossen/lora-benchmark && cd lora-benchmark && bash run_benchmark.sh
+git clone https://github.com/lucafossen/llm-gpu-bench && cd llm-gpu-bench && bash run_benchmark.sh
 ```
 
 The script installs Miniconda and all dependencies locally (no root required), then runs the benchmark. When finished, it writes:
