@@ -55,6 +55,10 @@ def parse_args():
     p.add_argument("--dtype",        default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--dataset-id",   default="yahma/alpaca-cleaned")
     p.add_argument("--max-samples",  type=int,   default=2000)
+    p.add_argument("--shard-model",  action="store_true",
+                   help="Shard model layers across GPUs (device_map='auto') instead of "
+                        "DataParallel. Use this when the model does not fit on a single GPU. "
+                        "Note: pipeline parallelism does NOT increase training throughput.")
     return p.parse_args()
 
 
@@ -162,6 +166,21 @@ class _GPUSampler:
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
+class _DPWrapper(torch.nn.Module):
+    """Makes a HuggingFace/PEFT model compatible with torch.nn.DataParallel.
+
+    DataParallel's gather() cannot handle HuggingFace ModelOutput objects.
+    Returning a plain loss Tensor from each replica lets DataParallel stack
+    them into a [N] tensor which the training loop averages.
+    """
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, **kwargs):
+        return self.model(**kwargs).loss
+
+
 def load_model(args, info: dict, devices: list):
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from peft import LoraConfig, get_peft_model
@@ -178,22 +197,25 @@ def load_model(args, info: dict, devices: list):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # Unified-memory GPUs (e.g. DGX Spark GB10, NVLink-C2C) share physical
-    # memory with the CPU. NVML reports 0 bytes of dedicated VRAM on these
-    # devices, which breaks Accelerate's infer_auto_device_map. Use an
-    # explicit single-device map instead.
-    # Discrete GPUs (A100, H100, …) use device_map="auto" with a max_memory
-    # budget so layers are spread only across the selected devices.
     is_unified = torch.cuda.get_device_properties(devices[0]).is_integrated
-    if is_unified:
-        _device_map = {"": devices[0]}
-        _max_memory = None
-    else:
+
+    if args.shard_model and len(devices) > 1 and not is_unified:
+        # Model sharding: distribute layers across GPUs via device_map="auto".
+        # Use this when the model is too large to fit on a single GPU.
+        # The forward pass runs sequentially GPU0→GPU1→…, so throughput does
+        # NOT scale with GPU count — but you gain access to combined VRAM.
         n_total = torch.cuda.device_count()
         _max_memory = {i: "0GiB" for i in range(n_total)}
         for i in devices:
             _max_memory[i] = torch.cuda.get_device_properties(i).total_memory
         _device_map = "auto"
+        print(f"Model sharding (device_map=auto) across {len(devices)} GPU(s): {devices}")
+    else:
+        # Data parallelism: load full model on devices[0]; DataParallel
+        # replicates it to other GPUs and splits batches. Throughput scales
+        # with GPU count. Requires the model to fit on a single GPU.
+        _max_memory = None
+        _device_map = {"": devices[0]}
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
@@ -218,6 +240,13 @@ def load_model(args, info: dict, devices: list):
     )
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
+
+    if len(devices) > 1 and not is_unified and not args.shard_model:
+        # Wrap in DataParallel: replicates the full model on each GPU and
+        # splits every batch along dim-0 so all GPUs work in parallel.
+        model = torch.nn.DataParallel(_DPWrapper(model), device_ids=devices)
+        print(f"DataParallel enabled: {len(devices)} GPU(s) {devices}")
+
     return model, tokenizer
 
 
@@ -295,9 +324,15 @@ def run_benchmark(args, model, dataset, devices: list):
         attention_mask = batch["attention_mask"].to(device)
         labels         = batch["labels"].to(device)
 
-        t0      = time.perf_counter()
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        loss    = outputs.loss / args.grad_accum
+        t0   = time.perf_counter()
+        raw  = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        # DataParallel stacks per-replica scalar losses into a [N] tensor.
+        # A plain model (single-GPU or shard mode) returns a ModelOutput.
+        if isinstance(model, torch.nn.DataParallel):
+            loss_val = raw.mean()
+        else:
+            loss_val = raw.loss
+        loss = loss_val / args.grad_accum
         loss.backward()
 
         if (step + 1) % args.grad_accum == 0:
@@ -322,7 +357,7 @@ def run_benchmark(args, model, dataset, devices: list):
             tps       = input_ids.numel() / (t1 - t0)
             vram_used = sum(torch.cuda.memory_allocated(i) for i in devices) / 1024 ** 3 if torch.cuda.is_available() else 0
             phase     = "[BENCH]" if step >= args.warmup_steps else "[WARM ]"
-            print(f"  {phase} step {step:>3} | loss={outputs.loss.item():.4f} "
+            print(f"  {phase} step {step:>3} | loss={loss_val.item():.4f} "
                   f"| {tps:>8,.0f} tok/s | VRAM {vram_used:.1f} GB")
 
         step += 1
