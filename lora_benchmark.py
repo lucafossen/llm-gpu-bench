@@ -2,12 +2,24 @@
 LoRA Fine-Tuning Throughput Benchmark
 Benchmarks LoRA training speed (tokens/sec) for a ~8B model on the current GPU.
 Outputs a JSON results file and a throughput PNG plot.
+
+Multi-GPU DDP (recommended):
+    torchrun --nproc_per_node=4 lora_benchmark.py --machine-label hydra
+
+Single-GPU or shard mode:
+    python lora_benchmark.py --machine-label hydra [--shard-model]
 """
 
 import argparse
 import datetime
 import json
 import math
+import os
+
+# Must be set before any CUDA allocation. Allows the allocator to grow segments
+# on demand, eliminating fragmentation-caused OOMs when reserved-but-unallocated
+# memory exceeds the requested allocation size.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import platform
 import statistics
 import subprocess
@@ -20,6 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import torch
+import torch.distributed as dist
 
 if not torch.cuda.is_available():
     build = getattr(torch.version, "cuda", None)
@@ -48,8 +61,8 @@ def parse_args():
     p.add_argument("--lora-dropout", type=float, default=0.05)
     p.add_argument("--max-seq-len",  type=int,   default=512,
                    help="Reduce to 256 if OOM on low-VRAM GPUs")
-    p.add_argument("--batch-size",   type=int,   default=4)
-    p.add_argument("--grad-accum",   type=int,   default=2)
+    p.add_argument("--batch-size",   type=int,   default=16)
+    p.add_argument("--grad-accum",   type=int,   default=4)
     p.add_argument("--warmup-steps", type=int,   default=5)
     p.add_argument("--bench-steps",  type=int,   default=50)
     p.add_argument("--dtype",        default="bf16", choices=["bf16", "fp16", "fp32"])
@@ -57,14 +70,21 @@ def parse_args():
     p.add_argument("--max-samples",  type=int,   default=2000)
     p.add_argument("--shard-model",  action="store_true",
                    help="Shard model layers across GPUs (device_map='auto') instead of "
-                        "DataParallel. Use this when the model does not fit on a single GPU. "
+                        "DDP. Use this when the model does not fit on a single GPU. "
                         "Note: pipeline parallelism does NOT increase training throughput.")
+    p.add_argument("--backend", default="hf", choices=["hf", "nemo"],
+                   help="Training backend: 'hf' (HuggingFace+PEFT, default) or "
+                        "'nemo' (NeMo AutoModel + native LoRA)")
     return p.parse_args()
 
 
 # ── Device resolution ─────────────────────────────────────────────────────────
 
 def resolve_devices(args) -> list:
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if local_rank != -1:
+        # DDP mode: each process owns exactly one GPU
+        return [local_rank]
     n = torch.cuda.device_count()
     if n == 0:
         return []
@@ -166,31 +186,22 @@ class _GPUSampler:
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
-class _DPWrapper(torch.nn.Module):
-    """Makes a HuggingFace/PEFT model compatible with torch.nn.DataParallel.
-
-    DataParallel's gather() cannot handle HuggingFace ModelOutput objects.
-    Returning a plain loss Tensor from each replica lets DataParallel stack
-    them into a [N] tensor which the training loop averages.
-    """
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, **kwargs):
-        return self.model(**kwargs).loss
-
-
 def load_model(args, info: dict, devices: list):
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from peft import LoraConfig, get_peft_model
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    ddp = local_rank != -1
+    is_main = local_rank <= 0
 
     torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
 
     vram_gb = info["vram_gb"]
-    print(f"VRAM: {vram_gb} GB  ->  LoRA ({args.dtype.upper()})")
+    if is_main:
+        print(f"VRAM: {vram_gb} GB  ->  LoRA ({args.dtype.upper()})")
+        print(f"Loading {args.model_id} ...")
 
-    print(f"Loading {args.model_id} ...")
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_id, token=args.hf_token, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -198,6 +209,12 @@ def load_model(args, info: dict, devices: list):
     tokenizer.padding_side = "right"
 
     is_unified = torch.cuda.get_device_properties(devices[0]).is_integrated
+
+    try:
+        import flash_attn  # noqa
+        _attn_impl = "sdpa" if is_unified else "flash_attention_2"
+    except ImportError:
+        _attn_impl = "sdpa"
 
     if args.shard_model and len(devices) > 1 and not is_unified:
         # Model sharding: distribute layers across GPUs via device_map="auto".
@@ -209,13 +226,11 @@ def load_model(args, info: dict, devices: list):
         for i in devices:
             _max_memory[i] = torch.cuda.get_device_properties(i).total_memory
         _device_map = "auto"
-        print(f"Model sharding (device_map=auto) across {len(devices)} GPU(s): {devices}")
+        if is_main:
+            print(f"Model sharding (device_map=auto) across {len(devices)} GPU(s): {devices}")
     else:
-        # Data parallelism: load full model on devices[0]; DataParallel
-        # replicates it to other GPUs and splits batches. Throughput scales
-        # with GPU count. Requires the model to fit on a single GPU.
         _max_memory = None
-        _device_map = {"": devices[0]}
+        _device_map = {"": f"cuda:{local_rank}"} if ddp else {"": devices[0]}
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
@@ -223,7 +238,7 @@ def load_model(args, info: dict, devices: list):
         dtype=torch_dtype,
         device_map=_device_map,
         max_memory=_max_memory,
-        attn_implementation="sdpa",
+        attn_implementation=_attn_impl,
         trust_remote_code=True,
     )
     model.config.use_cache = False
@@ -239,13 +254,105 @@ def load_model(args, info: dict, devices: list):
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_cfg)
-    model.print_trainable_parameters()
+    # Recompute activations during backward instead of storing them all.
+    # enable_input_require_grads() is required because PEFT freezes base weights.
+    model.enable_input_require_grads()
+    model.gradient_checkpointing_enable()
+    if is_main:
+        model.print_trainable_parameters()
 
-    if len(devices) > 1 and not is_unified and not args.shard_model:
-        # Wrap in DataParallel: replicates the full model on each GPU and
-        # splits every batch along dim-0 so all GPUs work in parallel.
-        model = torch.nn.DataParallel(_DPWrapper(model), device_ids=devices)
-        print(f"DataParallel enabled: {len(devices)} GPU(s) {devices}")
+    if ddp and not args.shard_model:
+        model = DDP(model, device_ids=[local_rank])
+        if is_main:
+            print(f"DDP enabled: {dist.get_world_size()} GPU(s)")
+
+    return model, tokenizer
+
+
+def load_model_nemo(args, info: dict, devices: list):
+    try:
+        from nemo.collections.llm import AutoModel
+        from nemo.collections.llm.peft import LoRA as NeMoLoRA
+    except ImportError as e:
+        raise SystemExit(
+            "[ERROR] --backend nemo requires: pip install nemo-automodel\n"
+            f"  {e}"
+        )
+    from transformers import AutoTokenizer
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    ddp = local_rank != -1
+    is_main = local_rank <= 0
+
+    torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
+                   "fp32": torch.float32}[args.dtype]
+
+    if is_main:
+        print(f"[nemo] Loading {args.model_id} via NeMo AutoModel ...")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_id, token=args.hf_token, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    if ddp:
+        device_map = {"": f"cuda:{local_rank}"}
+    else:
+        device_map = {"": devices[0]}
+
+    model = AutoModel.from_pretrained(
+        args.model_id,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
+        token=args.hf_token,
+        trust_remote_code=True,
+    )
+    model.config.use_cache = False
+
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"]
+    # Try NeMo's native LoRA first; fall back to PEFT if the API differs.
+    try:
+        lora = NeMoLoRA(
+            target_modules=target_modules,
+            dim=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+        )
+        model = lora(model)
+    except TypeError:
+        if is_main:
+            print("[nemo] NeMo LoRA constructor mismatch — falling back to PEFT")
+        from peft import LoraConfig, get_peft_model
+        lora_cfg = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_cfg)
+
+    try:
+        model.enable_input_require_grads()
+        model.gradient_checkpointing_enable()
+    except AttributeError:
+        if is_main:
+            print("[nemo] gradient checkpointing / input grads not available on this model")
+
+    if is_main:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"[nemo] trainable params: {trainable:,} / {total:,} "
+              f"({100 * trainable / total:.2f}%)")
+
+    if ddp:
+        model = DDP(model, device_ids=[local_rank])
+        if is_main:
+            print(f"[nemo] DDP enabled: {dist.get_world_size()} GPU(s)")
 
     return model, tokenizer
 
@@ -255,9 +362,13 @@ def load_model(args, info: dict, devices: list):
 def load_data(args, tokenizer):
     from datasets import load_dataset
 
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    is_main = local_rank <= 0
+
     raw = load_dataset(args.dataset_id, split="train")
     raw = raw.select(range(min(args.max_samples, len(raw))))
-    print(f"Loaded {len(raw)} samples from {args.dataset_id}")
+    if is_main:
+        print(f"Loaded {len(raw)} samples from {args.dataset_id}")
 
     def format_sample(ex):
         instruction = ex.get("instruction", "").strip()
@@ -277,22 +388,37 @@ def load_data(args, tokenizer):
     )
     tokenized = tokenized.map(lambda ex: {"labels": ex["input_ids"].copy()})
     tokenized.set_format(type="torch")
-    print(f"Dataset ready: {len(tokenized)} samples, max_seq_len={args.max_seq_len}")
+    if is_main:
+        print(f"Dataset ready: {len(tokenized)} samples, max_seq_len={args.max_seq_len}")
     return tokenized
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 def run_benchmark(args, model, dataset, devices: list):
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, DistributedSampler
     from torch.optim import AdamW
     from transformers import get_linear_schedule_with_warmup
+
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    ddp = local_rank != -1
+    is_main = local_rank <= 0
+    world_size = dist.get_world_size() if ddp else 1
 
     # pin_memory speeds up PCIe transfers to discrete GPUs; on unified-memory
     # systems (e.g. DGX Spark GB10) the CPU and GPU share physical memory so
     # pinning pages adds overhead with no benefit.
     _pin_memory = not torch.cuda.get_device_properties(devices[0]).is_integrated
-    loader    = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, pin_memory=_pin_memory)
+
+    if ddp:
+        dist_sampler = DistributedSampler(dataset, shuffle=True)
+        dist_sampler.set_epoch(0)
+        loader = DataLoader(dataset, batch_size=args.batch_size, sampler=dist_sampler,
+                            pin_memory=_pin_memory)
+    else:
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+                            pin_memory=_pin_memory)
+
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4)
     total_steps = args.warmup_steps + args.bench_steps
     scheduler = get_linear_schedule_with_warmup(
@@ -310,11 +436,13 @@ def run_benchmark(args, model, dataset, devices: list):
     step_times   = []
 
     tokens_per_step = args.batch_size * args.max_seq_len
-    print(f"\nWarmup: {args.warmup_steps} steps | Benchmark: {args.bench_steps} steps")
-    print(f"Batch: {args.batch_size} | Seq len: {args.max_seq_len} | Tokens/step: {tokens_per_step:,}")
-    print("-" * 60)
+    if is_main:
+        print(f"\nWarmup: {args.warmup_steps} steps | Benchmark: {args.bench_steps} steps")
+        print(f"Batch: {args.batch_size}×{world_size} GPUs | Seq len: {args.max_seq_len} "
+              f"| Tokens/step: {tokens_per_step * world_size:,} (all GPUs)")
+        print("-" * 60)
 
-    sampler = _GPUSampler(devices=devices, interval=0.5)
+    gpu_sampler = _GPUSampler(devices=devices, interval=0.5) if is_main else None
 
     for batch in loader:
         if step >= total_steps:
@@ -324,14 +452,123 @@ def run_benchmark(args, model, dataset, devices: list):
         attention_mask = batch["attention_mask"].to(device)
         labels         = batch["labels"].to(device)
 
-        t0   = time.perf_counter()
-        raw  = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        # DataParallel stacks per-replica scalar losses into a [N] tensor.
-        # A plain model (single-GPU or shard mode) returns a ModelOutput.
-        if isinstance(model, torch.nn.DataParallel):
-            loss_val = raw.mean()
-        else:
+        t0       = time.perf_counter()
+        raw      = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        loss_val = raw.loss
+        loss     = loss_val / args.grad_accum
+        loss.backward()
+
+        if (step + 1) % args.grad_accum == 0:
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        if step == args.warmup_steps:
+            bench_start = time.perf_counter()
+            if gpu_sampler is not None:
+                gpu_sampler.start()
+            if is_main:
+                print("  Warmup done. Starting benchmark ...")
+
+        if step >= args.warmup_steps:
+            bench_tokens += input_ids.numel()
+            step_times.append(t1 - t0)
+
+        if is_main and step % 10 == 0:
+            tps       = input_ids.numel() * world_size / (t1 - t0)
+            vram_used = sum(torch.cuda.memory_allocated(i) for i in devices) / 1024 ** 3 if torch.cuda.is_available() else 0
+            phase     = "[BENCH]" if step >= args.warmup_steps else "[WARM ]"
+            print(f"  {phase} step {step:>3} | loss={loss_val.item():.4f} "
+                  f"| {tps:>8,.0f} tok/s | VRAM {vram_used:.1f} GB")
+
+        step += 1
+
+    if gpu_sampler is not None:
+        gpu_sampler.stop()
+    if bench_start is None:
+        raise SystemExit("[ERROR] Benchmark never started - warmup_steps exceeds the number of available batches.")
+    bench_wall = time.perf_counter() - bench_start
+    if is_main:
+        print("-" * 60)
+        print("Benchmark loop complete.")
+    gpu_stats = gpu_sampler.summary() if gpu_sampler is not None else {}
+    # Scale rank-0 token count to the total across all processes.
+    # All ranks run the same steps/batch_size so this is exact.
+    bench_tokens *= world_size
+    return step_times, bench_tokens, bench_wall, gpu_stats, param_bytes, world_size
+
+
+def run_benchmark_nemo(args, model, dataset, devices: list):
+    """Same benchmark loop as run_benchmark() but with defensive loss extraction
+    for NeMo AutoModel, which may return outputs as a dict or tuple rather than
+    a CausalLMOutput object with a .loss attribute."""
+    from torch.utils.data import DataLoader, DistributedSampler
+    from torch.optim import AdamW
+    from transformers import get_linear_schedule_with_warmup
+
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    ddp = local_rank != -1
+    is_main = local_rank <= 0
+    world_size = dist.get_world_size() if ddp else 1
+
+    _pin_memory = not torch.cuda.get_device_properties(devices[0]).is_integrated
+
+    if ddp:
+        dist_sampler = DistributedSampler(dataset, shuffle=True)
+        dist_sampler.set_epoch(0)
+        loader = DataLoader(dataset, batch_size=args.batch_size, sampler=dist_sampler,
+                            pin_memory=_pin_memory)
+    else:
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+                            pin_memory=_pin_memory)
+
+    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4)
+    total_steps = args.warmup_steps + args.bench_steps
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps)
+
+    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+
+    model.train()
+    device = next(model.parameters()).device
+
+    step         = 0
+    bench_start  = None
+    bench_tokens = 0
+    step_times   = []
+
+    tokens_per_step = args.batch_size * args.max_seq_len
+    if is_main:
+        print(f"\n[nemo] Warmup: {args.warmup_steps} steps | Benchmark: {args.bench_steps} steps")
+        print(f"[nemo] Batch: {args.batch_size}×{world_size} GPUs | Seq len: {args.max_seq_len} "
+              f"| Tokens/step: {tokens_per_step * world_size:,} (all GPUs)")
+        print("-" * 60)
+
+    gpu_sampler = _GPUSampler(devices=devices, interval=0.5) if is_main else None
+
+    for batch in loader:
+        if step >= total_steps:
+            break
+
+        input_ids      = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels         = batch["labels"].to(device)
+
+        t0  = time.perf_counter()
+        raw = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
+        # Defensive loss extraction: handle CausalLMOutput, dict, and tuple
+        if hasattr(raw, "loss"):
             loss_val = raw.loss
+        elif isinstance(raw, dict):
+            loss_val = raw["loss"]
+        else:
+            loss_val = raw[0]
+
         loss = loss_val / args.grad_accum
         loss.backward()
 
@@ -346,37 +583,43 @@ def run_benchmark(args, model, dataset, devices: list):
 
         if step == args.warmup_steps:
             bench_start = time.perf_counter()
-            sampler.start()
-            print("  Warmup done. Starting benchmark ...")
+            if gpu_sampler is not None:
+                gpu_sampler.start()
+            if is_main:
+                print("[nemo]   Warmup done. Starting benchmark ...")
 
         if step >= args.warmup_steps:
             bench_tokens += input_ids.numel()
             step_times.append(t1 - t0)
 
-        if step % 10 == 0:
-            tps       = input_ids.numel() / (t1 - t0)
+        if is_main and step % 10 == 0:
+            tps       = input_ids.numel() * world_size / (t1 - t0)
             vram_used = sum(torch.cuda.memory_allocated(i) for i in devices) / 1024 ** 3 if torch.cuda.is_available() else 0
             phase     = "[BENCH]" if step >= args.warmup_steps else "[WARM ]"
-            print(f"  {phase} step {step:>3} | loss={loss_val.item():.4f} "
+            print(f"  [nemo]{phase} step {step:>3} | loss={loss_val.item():.4f} "
                   f"| {tps:>8,.0f} tok/s | VRAM {vram_used:.1f} GB")
 
         step += 1
 
-    sampler.stop()
+    if gpu_sampler is not None:
+        gpu_sampler.stop()
     if bench_start is None:
-        raise SystemExit("[ERROR] Benchmark never started - warmup_steps exceeds the number of available batches.")
+        raise SystemExit("[ERROR] NeMo benchmark never started - warmup_steps exceeds the number of available batches.")
     bench_wall = time.perf_counter() - bench_start
-    print("-" * 60)
-    print("Benchmark loop complete.")
-    return step_times, bench_tokens, bench_wall, sampler.summary(), param_bytes
+    if is_main:
+        print("-" * 60)
+        print("[nemo] Benchmark loop complete.")
+    gpu_stats = gpu_sampler.summary() if gpu_sampler is not None else {}
+    bench_tokens *= world_size
+    return step_times, bench_tokens, bench_wall, gpu_stats, param_bytes, world_size
 
 
 # ── Results ───────────────────────────────────────────────────────────────────
 
 def summarise(args, info: dict,
               step_times, bench_tokens, bench_wall, gpu_samples: dict, param_bytes: int,
-              devices: list):
-    tokens_per_step = args.batch_size * args.max_seq_len
+              devices: list, world_size: int = 1):
+    tokens_per_step = args.batch_size * args.max_seq_len * world_size
     per_step_tps    = [tokens_per_step / t for t in step_times]
     mean_tps        = statistics.mean(per_step_tps)
     median_tps      = statistics.median(per_step_tps)
@@ -482,6 +725,7 @@ def save_json(args, info: dict, metrics: dict):
     fname = f"results_{safe_label}.json"
     results = {
         "timestamp":       datetime.datetime.now().isoformat(),
+        "backend":         args.backend,
         "machine":         args.machine_label,
         "model":           args.model_id,
         "gpu":             info["gpu"],
@@ -516,22 +760,45 @@ def save_json(args, info: dict, metrics: dict):
 def main():
     args = parse_args()
 
-    print("=" * 60)
-    print(" LoRA Throughput Benchmark")
-    print("=" * 60)
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    ddp = local_rank != -1
+    if ddp:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+    is_main = local_rank <= 0
+
+    if is_main:
+        print("=" * 60)
+        print(f" LoRA Throughput Benchmark  [backend: {args.backend}]")
+        print("=" * 60)
 
     devices = resolve_devices(args)
-    print(f"Using GPU(s): {devices}")
+    if is_main:
+        print(f"Using GPU(s): {devices}")
 
     info = gpu_info(args.machine_label, devices)
-    print(json.dumps(info, indent=2))
+    if is_main:
+        print(json.dumps(info, indent=2))
 
-    model, tokenizer = load_model(args, info, devices)
+    if args.backend == "nemo":
+        model, tokenizer = load_model_nemo(args, info, devices)
+    else:
+        model, tokenizer = load_model(args, info, devices)
+
     dataset = load_data(args, tokenizer)
-    step_times, bench_tokens, bench_wall, gpu_samples, param_bytes = run_benchmark(args, model, dataset, devices)
-    metrics = summarise(args, info, step_times, bench_tokens, bench_wall, gpu_samples, param_bytes, devices)
-    save_plot(args, info, metrics)
-    save_json(args, info, metrics)
+
+    if args.backend == "nemo":
+        step_times, bench_tokens, bench_wall, gpu_samples, param_bytes, world_size = run_benchmark_nemo(args, model, dataset, devices)
+    else:
+        step_times, bench_tokens, bench_wall, gpu_samples, param_bytes, world_size = run_benchmark(args, model, dataset, devices)
+
+    if is_main:
+        metrics = summarise(args, info, step_times, bench_tokens, bench_wall, gpu_samples, param_bytes, devices, world_size)
+        save_plot(args, info, metrics)
+        save_json(args, info, metrics)
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

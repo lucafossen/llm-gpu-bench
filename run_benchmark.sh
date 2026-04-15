@@ -14,11 +14,13 @@ PYTHON_VERSION="3.11"
 
 # ── Parse arguments ─────────────────────────────────────────────────────────
 MACHINE_LABEL="$(hostname -s)"
+BACKEND="hf"
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --machine-label) MACHINE_LABEL="$2"; shift 2 ;;
+        --backend)       BACKEND="$2"; EXTRA_ARGS+=("--backend" "$2"); shift 2 ;;
         *)               EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
@@ -144,6 +146,11 @@ fi
 pip install -q transformers peft datasets accelerate trl \
                matplotlib pandas numpy
 
+if [[ "$BACKEND" == "nemo" ]]; then
+    echo "==> Installing nemo-automodel (required for --backend nemo) ..."
+    pip install -q nemo-automodel
+fi
+
 # ── Run benchmark ────────────────────────────────────────────────────────────
 echo ""
 echo "==> Running benchmark (machine: '${MACHINE_LABEL}') ..."
@@ -158,3 +165,4 @@ echo ""
 echo "==> Done!  Results written to:"
 echo "      $SCRIPT_DIR/results_${SAFE_LABEL}.json"
 echo "      $SCRIPT_DIR/throughput_${SAFE_LABEL}.png"
+echo "      Backend: $BACKEND"
