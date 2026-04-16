@@ -125,12 +125,13 @@ fi
 
 install_cuda_torch() {
     # Installs the CUDA-enabled torch wheel from the detected index URL.
-    # Called once for --backend hf, and again after nemo-automodel for
-    # --backend nemo (since nemo pulls a CPU-only torch from PyPI).
+    # --upgrade is required when called after nemo-automodel: nemo pins an
+    # older CPU-only torch, and without --upgrade pip treats it as already
+    # satisfied and skips the install entirely.
     if [[ "$TORCH_NIGHTLY" -eq 1 ]]; then
-        pip install -q --pre torch --index-url "$TORCH_INDEX"
+        pip install -q --pre torch --upgrade --index-url "$TORCH_INDEX"
     else
-        pip install -q torch --index-url "$TORCH_INDEX"
+        pip install -q torch --upgrade --index-url "$TORCH_INDEX"
     fi
 }
 
