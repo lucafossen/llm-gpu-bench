@@ -269,15 +269,54 @@ def load_model(args, info: dict, devices: list):
     return model, tokenizer
 
 
-def load_model_nemo(args, info: dict, devices: list):
+def _nemo_imports():
+    """Try the known import paths for nemo-automodel across package versions.
+
+    nemo-automodel <=0.2.x: nemo.collections.llm namespace
+    nemo-automodel  0.3.x:  nemo_automodel namespace (renamed)
+    Returns (AutoModel, LoRA) or raises SystemExit with a diagnostic.
+    """
+    errors = []
+    # Path 1: nemo.collections.llm (pre-0.3 / nemo_toolkit style)
     try:
         from nemo.collections.llm import AutoModel
         from nemo.collections.llm.peft import LoRA as NeMoLoRA
+        return AutoModel, NeMoLoRA
     except ImportError as e:
-        raise SystemExit(
-            "[ERROR] --backend nemo requires: pip install nemo-automodel\n"
-            f"  {e}"
-        )
+        errors.append(f"  nemo.collections.llm: {e}")
+
+    # Path 2: nemo_automodel namespace (0.3+)
+    try:
+        from nemo_automodel import AutoModel
+        from nemo_automodel.peft import LoRA as NeMoLoRA
+        return AutoModel, NeMoLoRA
+    except ImportError as e:
+        errors.append(f"  nemo_automodel: {e}")
+
+    # Path 3: nemo_automodel.collections.llm
+    try:
+        from nemo_automodel.collections.llm import AutoModel
+        from nemo_automodel.collections.llm.peft import LoRA as NeMoLoRA
+        return AutoModel, NeMoLoRA
+    except ImportError as e:
+        errors.append(f"  nemo_automodel.collections.llm: {e}")
+
+    raise SystemExit(
+        "[ERROR] --backend nemo requires: pip install nemo-automodel\n"
+        "  Tried all known import paths and all failed:\n"
+        + "\n".join(errors) + "\n"
+        "  Run: python -c \"import pkg_resources; "
+        "print(list(pkg_resources.get_distribution('nemo-automodel')"
+        ".get_metadata('top_level.txt').strip().split()))\" "
+        "to see what module the installed package provides."
+    )
+
+
+def load_model_nemo(args, info: dict, devices: list):
+    try:
+        AutoModel, NeMoLoRA = _nemo_imports()
+    except SystemExit:
+        raise
     from transformers import AutoTokenizer
     from torch.nn.parallel import DistributedDataParallel as DDP
 
