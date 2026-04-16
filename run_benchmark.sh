@@ -117,11 +117,33 @@ TORCH_INDEX_RAW="$(detect_torch_index_url)"
 echo "==> Detected PyTorch index: $TORCH_INDEX_RAW"
 if [[ "$TORCH_INDEX_RAW" == nightly:* ]]; then
     TORCH_INDEX="${TORCH_INDEX_RAW#nightly:}"
-    # torchvision excluded: nightly removed VideoReader, which breaks datasets' torch formatter
-    pip install -q --pre torch --index-url "$TORCH_INDEX"
+    TORCH_NIGHTLY=1
 else
     TORCH_INDEX="$TORCH_INDEX_RAW"
-    pip install -q torch --index-url "$TORCH_INDEX"
+    TORCH_NIGHTLY=0
+fi
+
+install_cuda_torch() {
+    # Installs the CUDA-enabled torch wheel from the detected index URL.
+    # Called once for --backend hf, and again after nemo-automodel for
+    # --backend nemo (since nemo pulls a CPU-only torch from PyPI).
+    if [[ "$TORCH_NIGHTLY" -eq 1 ]]; then
+        pip install -q --pre torch --index-url "$TORCH_INDEX"
+    else
+        pip install -q torch --index-url "$TORCH_INDEX"
+    fi
+}
+
+if [[ "$BACKEND" == "nemo" ]]; then
+    # Install nemo-automodel first so it can resolve its own dependencies.
+    # It will pull a CPU-only torch from PyPI — we reinstall the CUDA wheel
+    # on top afterwards so nemo gets the right torch for this machine.
+    echo "==> Installing nemo-automodel ..."
+    pip install -q nemo-automodel
+    echo "==> Installing CUDA-enabled PyTorch (overriding nemo's CPU torch) ..."
+    install_cuda_torch
+else
+    install_cuda_torch
 fi
 
 # Verify CUDA is accessible after install
@@ -145,11 +167,6 @@ fi
 
 pip install -q transformers peft datasets accelerate trl \
                matplotlib pandas numpy
-
-if [[ "$BACKEND" == "nemo" ]]; then
-    echo "==> Installing nemo-automodel (required for --backend nemo) ..."
-    pip install -q nemo-automodel
-fi
 
 # ── Run benchmark ────────────────────────────────────────────────────────────
 echo ""
