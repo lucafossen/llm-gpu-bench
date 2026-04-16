@@ -124,27 +124,25 @@ else
 fi
 
 install_cuda_torch() {
-    # Installs the CUDA-enabled torch wheel from the detected index URL.
-    # Used by the hf backend; the nemo backend lets nemo-automodel resolve
-    # torch via --extra-index-url instead.
+    # --no-deps skips pip's resolver so it won't remove nemo-automodel when
+    # it detects a version conflict (nemo 0.3.0 metadata says torch<=2.10.0
+    # but its runtime actually requires >=2.11.0 — a bug in nemo's metadata).
+    # --force-reinstall ensures the existing wheel is replaced regardless.
     if [[ "$TORCH_NIGHTLY" -eq 1 ]]; then
-        pip install -q --pre torch --index-url "$TORCH_INDEX"
+        pip install -q --pre torch --no-deps --force-reinstall --index-url "$TORCH_INDEX"
     else
-        pip install -q torch --index-url "$TORCH_INDEX"
+        pip install -q torch --no-deps --force-reinstall --index-url "$TORCH_INDEX"
     fi
 }
 
 if [[ "$BACKEND" == "nemo" ]]; then
-    # Let nemo-automodel manage its own torch version. We pass the detected
-    # CUDA index (and cu124 as a fallback) as extra-index-urls so pip can
-    # find a CUDA-enabled wheel within nemo's required torch range.
-    # Note: cu130 starts at torch 2.11.0 which is outside nemo 0.3.0's
-    # range (<=2.10.0), so cu124 is needed as a fallback; CUDA 13.0 drivers
-    # are backward-compatible with cu124 builds.
-    echo "==> Installing nemo-automodel (letting nemo resolve torch version) ..."
-    pip install -q nemo-automodel \
-        --extra-index-url "$TORCH_INDEX" \
-        --extra-index-url "https://download.pytorch.org/whl/cu124"
+    echo "==> Installing nemo-automodel ..."
+    pip install -q nemo-automodel
+    # nemo-automodel 0.3.0 pip metadata declares torch<=2.10.0 but its
+    # runtime requires torch>=2.11.0. Install the correct CUDA wheel after
+    # nemo so pip's resolver doesn't remove nemo when it sees the conflict.
+    echo "==> Installing CUDA-enabled PyTorch (nemo requires >=2.11.0 at runtime) ..."
+    install_cuda_torch
 else
     install_cuda_torch
 fi
