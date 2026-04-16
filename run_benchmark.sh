@@ -124,25 +124,28 @@ else
 fi
 
 install_cuda_torch() {
-    # --no-deps skips pip's resolver so it won't remove nemo-automodel when
-    # it detects a version conflict (nemo 0.3.0 metadata says torch<=2.10.0
-    # but its runtime actually requires >=2.11.0 — a bug in nemo's metadata).
-    # --force-reinstall ensures the existing wheel is replaced regardless.
     if [[ "$TORCH_NIGHTLY" -eq 1 ]]; then
-        pip install -q --pre torch --no-deps --force-reinstall --index-url "$TORCH_INDEX"
+        pip install -q --pre torch --upgrade --index-url "$TORCH_INDEX"
     else
-        pip install -q torch --no-deps --force-reinstall --index-url "$TORCH_INDEX"
+        pip install -q torch --upgrade --index-url "$TORCH_INDEX"
     fi
 }
 
 if [[ "$BACKEND" == "nemo" ]]; then
     echo "==> Installing nemo-automodel ..."
     pip install -q nemo-automodel
-    # nemo-automodel 0.3.0 pip metadata declares torch<=2.10.0 but its
-    # runtime requires torch>=2.11.0. Install the correct CUDA wheel after
-    # nemo so pip's resolver doesn't remove nemo when it sees the conflict.
+    # nemo-automodel 0.3.0 metadata incorrectly pins torch<=2.10.0 but
+    # requires >=2.11.0 at runtime. Upgrade torch with its full dep tree
+    # (so nvidia-cudnn and friends are present). pip's resolver may remove
+    # nemo-automodel as a side effect of the version conflict — reinstall
+    # it with --no-deps afterwards to put the files back without re-adding
+    # the broken torch pin.
     echo "==> Installing CUDA-enabled PyTorch (nemo requires >=2.11.0 at runtime) ..."
     install_cuda_torch
+    if ! python -c "import nemo_automodel" 2>/dev/null; then
+        echo "==> Reinstalling nemo-automodel files (removed by pip resolver during torch upgrade) ..."
+        pip install -q nemo-automodel --no-deps
+    fi
 else
     install_cuda_torch
 fi
