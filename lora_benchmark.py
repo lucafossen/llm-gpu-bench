@@ -269,55 +269,15 @@ def load_model(args, info: dict, devices: list):
     return model, tokenizer
 
 
-def _nemo_imports():
-    """Try the known import paths for nemo-automodel across package versions.
-
-    nemo-automodel <=0.2.x: nemo.collections.llm namespace
-    nemo-automodel  0.3.x:  nemo_automodel namespace (renamed)
-    Returns (AutoModel, LoRA) or raises SystemExit with a diagnostic.
-    """
-    errors = []
-    # Path 1: nemo.collections.llm (pre-0.3 / nemo_toolkit style)
-    try:
-        from nemo.collections.llm import AutoModel
-        from nemo.collections.llm.peft import LoRA as NeMoLoRA
-        return AutoModel, NeMoLoRA
-    except ImportError as e:
-        errors.append(f"  nemo.collections.llm: {e}")
-
-    # Path 2: nemo_automodel namespace (0.3+)
-    try:
-        from nemo_automodel import AutoModel
-        from nemo_automodel.peft import LoRA as NeMoLoRA
-        return AutoModel, NeMoLoRA
-    except ImportError as e:
-        errors.append(f"  nemo_automodel: {e}")
-
-    # Path 3: nemo_automodel.collections.llm
-    try:
-        from nemo_automodel.collections.llm import AutoModel
-        from nemo_automodel.collections.llm.peft import LoRA as NeMoLoRA
-        return AutoModel, NeMoLoRA
-    except ImportError as e:
-        errors.append(f"  nemo_automodel.collections.llm: {e}")
-
-    raise SystemExit(
-        "[ERROR] --backend nemo requires: pip install nemo-automodel\n"
-        "  Tried all known import paths and all failed:\n"
-        + "\n".join(errors) + "\n"
-        "  Run: python -c \"import pkg_resources; "
-        "print(list(pkg_resources.get_distribution('nemo-automodel')"
-        ".get_metadata('top_level.txt').strip().split()))\" "
-        "to see what module the installed package provides."
-    )
-
-
 def load_model_nemo(args, info: dict, devices: list):
     try:
-        AutoModel, NeMoLoRA = _nemo_imports()
-    except SystemExit:
-        raise
-    from transformers import AutoTokenizer
+        from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoTokenizer
+    except ImportError as e:
+        raise SystemExit(
+            "[ERROR] --backend nemo requires: pip install nemo-automodel\n"
+            f"  {e}"
+        )
+    from peft import LoraConfig, get_peft_model
     from torch.nn.parallel import DistributedDataParallel as DDP
 
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -328,9 +288,9 @@ def load_model_nemo(args, info: dict, devices: list):
                    "fp32": torch.float32}[args.dtype]
 
     if is_main:
-        print(f"[nemo] Loading {args.model_id} via NeMo AutoModel ...")
+        print(f"[nemo] Loading {args.model_id} via NeMoAutoModelForCausalLM ...")
 
-    tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = NeMoAutoTokenizer.from_pretrained(
         args.model_id, token=args.hf_token, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -341,7 +301,9 @@ def load_model_nemo(args, info: dict, devices: list):
     else:
         device_map = {"": devices[0]}
 
-    model = AutoModel.from_pretrained(
+    # NeMoAutoModelForCausalLM is a drop-in for HF's AutoModelForCausalLM,
+    # so PEFT LoRA applies to it directly.
+    model = NeMoAutoModelForCausalLM.from_pretrained(
         args.model_id,
         torch_dtype=torch_dtype,
         device_map=device_map,
@@ -352,41 +314,20 @@ def load_model_nemo(args, info: dict, devices: list):
 
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
                       "gate_proj", "up_proj", "down_proj"]
-    # Try NeMo's native LoRA first; fall back to PEFT if the API differs.
-    try:
-        lora = NeMoLoRA(
-            target_modules=target_modules,
-            dim=args.lora_rank,
-            alpha=args.lora_alpha,
-            dropout=args.lora_dropout,
-        )
-        model = lora(model)
-    except TypeError:
-        if is_main:
-            print("[nemo] NeMo LoRA constructor mismatch — falling back to PEFT")
-        from peft import LoraConfig, get_peft_model
-        lora_cfg = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=target_modules,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, lora_cfg)
-
-    try:
-        model.enable_input_require_grads()
-        model.gradient_checkpointing_enable()
-    except AttributeError:
-        if is_main:
-            print("[nemo] gradient checkpointing / input grads not available on this model")
+    lora_cfg = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_cfg)
+    model.enable_input_require_grads()
+    model.gradient_checkpointing_enable()
 
     if is_main:
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in model.parameters())
-        print(f"[nemo] trainable params: {trainable:,} / {total:,} "
-              f"({100 * trainable / total:.2f}%)")
+        model.print_trainable_parameters()
 
     if ddp:
         model = DDP(model, device_ids=[local_rank])
