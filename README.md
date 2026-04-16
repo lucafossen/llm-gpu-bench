@@ -33,16 +33,39 @@ bash run_benchmark.sh --devices 0,1
 
 By default all available GPUs are used.
 
+## Backends
+
+The benchmark supports two training backends, selectable with `--backend`:
+
+### HuggingFace + PEFT (default)
+
+```bash
+bash run_benchmark.sh --backend hf
+```
+
+Uses `transformers.AutoModelForCausalLM` + PEFT `LoraConfig`. Multi-GPU via PyTorch DDP (`torchrun`).
+
+### NeMo AutoModel
+
+```bash
+bash run_benchmark.sh --backend nemo
+```
+
+Uses NVIDIA's [`nemo-automodel`](https://github.com/NVIDIA-NeMo/Automodel) package — `nemo.collections.llm.AutoModel` with NeMo's native LoRA. `nemo-automodel` is installed automatically when this backend is selected. Multi-GPU via DDP.
+
+Both backends produce identical output files with the same JSON schema. The `"backend"` field in the JSON identifies which was used.
+
 ## Options
 
 | Flag | Default | Description |
 |---|---|---|
 | `--machine-label` | hostname | Label used in output filenames and reports |
+| `--backend` | `hf` | Training backend: `hf` (HuggingFace+PEFT) or `nemo` (NeMo AutoModel) |
 | `--devices` | all GPUs | Comma-separated GPU indices to use, e.g. `0,1` |
 | `--model-id` | `Qwen/Qwen2.5-7B-Instruct` | Any HuggingFace causal LM |
 | `--hf-token` | none | Required for gated models (e.g. Llama) |
 | `--max-seq-len` | 512 | Reduce to 256 if you get OOM errors |
-| `--batch-size` | 4 | Per-device batch size |
+| `--batch-size` | 16 | Per-device batch size |
 
 ## Output fields
 
@@ -50,6 +73,7 @@ Each run produces a `results_<machine>.json` with the following fields:
 
 | Field | Description |
 |---|---|
+| `backend` | Training backend used: `hf` or `nemo` |
 | `mean_tps` | Average tokens/second across all benchmark steps |
 | `median_tps` | Median tokens/second, less sensitive to outlier steps than the mean |
 | `peak_tps` | Best single-step throughput recorded |
