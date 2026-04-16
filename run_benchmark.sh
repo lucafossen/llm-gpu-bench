@@ -125,24 +125,26 @@ fi
 
 install_cuda_torch() {
     # Installs the CUDA-enabled torch wheel from the detected index URL.
-    # --upgrade is required when called after nemo-automodel: nemo pins an
-    # older CPU-only torch, and without --upgrade pip treats it as already
-    # satisfied and skips the install entirely.
+    # Used by the hf backend; the nemo backend lets nemo-automodel resolve
+    # torch via --extra-index-url instead.
     if [[ "$TORCH_NIGHTLY" -eq 1 ]]; then
-        pip install -q --pre torch --upgrade --index-url "$TORCH_INDEX"
+        pip install -q --pre torch --index-url "$TORCH_INDEX"
     else
-        pip install -q torch --upgrade --index-url "$TORCH_INDEX"
+        pip install -q torch --index-url "$TORCH_INDEX"
     fi
 }
 
 if [[ "$BACKEND" == "nemo" ]]; then
-    # Install nemo-automodel first so it can resolve its own dependencies.
-    # It will pull a CPU-only torch from PyPI — we reinstall the CUDA wheel
-    # on top afterwards so nemo gets the right torch for this machine.
-    echo "==> Installing nemo-automodel ..."
-    pip install -q nemo-automodel
-    echo "==> Installing CUDA-enabled PyTorch (overriding nemo's CPU torch) ..."
-    install_cuda_torch
+    # Let nemo-automodel manage its own torch version. We pass the detected
+    # CUDA index (and cu124 as a fallback) as extra-index-urls so pip can
+    # find a CUDA-enabled wheel within nemo's required torch range.
+    # Note: cu130 starts at torch 2.11.0 which is outside nemo 0.3.0's
+    # range (<=2.10.0), so cu124 is needed as a fallback; CUDA 13.0 drivers
+    # are backward-compatible with cu124 builds.
+    echo "==> Installing nemo-automodel (letting nemo resolve torch version) ..."
+    pip install -q nemo-automodel \
+        --extra-index-url "$TORCH_INDEX" \
+        --extra-index-url "https://download.pytorch.org/whl/cu124"
 else
     install_cuda_torch
 fi
