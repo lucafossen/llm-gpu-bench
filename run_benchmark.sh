@@ -3,14 +3,13 @@
 # Usage: bash run_benchmark.sh [--machine-label "A100 80GB"] [--model-id MODEL] [--hf-token TOKEN] [--devices 0,1,2]
 #
 # Drop this directory on any Linux/macOS GPU server and run this script.
-# It will install Miniconda locally (./miniconda3), create a conda env, install
-# all Python deps, run the benchmark, and print the path to the result files.
+# It will install uv (if needed), create a local .venv with Python 3.12,
+# install all Python deps, run the benchmark, and print the result file paths.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONDA_DIR="$SCRIPT_DIR/miniconda3"
-ENV_NAME="lora_bench"
-PYTHON_VERSION="3.11"
+VENV_DIR="$SCRIPT_DIR/.venv"
+PYTHON_VERSION="3.12"
 
 # ── Parse arguments ─────────────────────────────────────────────────────────
 MACHINE_LABEL="$(hostname -s)"
@@ -25,47 +24,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ── Install Miniconda (local, non-root) ──────────────────────────────────────
-if [[ ! -x "$CONDA_DIR/bin/conda" ]]; then
-    echo "==> Miniconda not found — installing to $CONDA_DIR"
-    OS="$(uname -s)"
-    ARCH="$(uname -m)"
-    case "$OS-$ARCH" in
-        Linux-x86_64)   INSTALLER="Miniconda3-latest-Linux-x86_64.sh" ;;
-        Linux-aarch64)  INSTALLER="Miniconda3-latest-Linux-aarch64.sh" ;;
-        Darwin-x86_64)  INSTALLER="Miniconda3-latest-MacOSX-x86_64.sh" ;;
-        Darwin-arm64)   INSTALLER="Miniconda3-latest-MacOSX-arm64.sh" ;;
-        *) echo "Unsupported OS/arch: $OS-$ARCH"; exit 1 ;;
-    esac
-    INSTALLER_PATH="/tmp/$INSTALLER"
-    if command -v wget &>/dev/null; then
-        wget -q --show-progress "https://repo.anaconda.com/miniconda/$INSTALLER" -O "$INSTALLER_PATH"
+# ── Ensure uv is available ───────────────────────────────────────────────────
+if ! command -v uv &>/dev/null; then
+    if [[ -x "${HOME}/.local/bin/uv" ]]; then
+        export PATH="${HOME}/.local/bin:$PATH"
     else
-        curl -fL "https://repo.anaconda.com/miniconda/$INSTALLER" -o "$INSTALLER_PATH"
+        echo "==> Installing uv ..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="${HOME}/.local/bin:$PATH"
     fi
-    bash "$INSTALLER_PATH" -b -p "$CONDA_DIR"
-    rm -f "$INSTALLER_PATH"
-    echo "==> Miniconda installed."
 fi
-
-# ── Activate conda ───────────────────────────────────────────────────────────
-# shellcheck source=/dev/null
-source "$CONDA_DIR/etc/profile.d/conda.sh"
-
-# ── Accept conda ToS (required since Anaconda repo policy update) ────────────
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-
-# ── Create env ───────────────────────────────────────────────────────────────
-if ! conda env list | grep -qE "^${ENV_NAME}[[:space:]]"; then
-    echo "==> Creating conda env '${ENV_NAME}' (Python ${PYTHON_VERSION}) ..."
-    conda create -y -n "$ENV_NAME" python="$PYTHON_VERSION"
-fi
-
-conda activate "$ENV_NAME"
 
 # ── Detect CUDA version and select PyTorch wheel index ───────────────────────
-# Returns either a stable index URL or "nightly:<url>" for pre-release wheels.
 detect_torch_index_url() {
     if ! command -v nvidia-smi &>/dev/null; then
         echo "https://download.pytorch.org/whl/cpu"; return
@@ -79,22 +49,14 @@ detect_torch_index_url() {
     major=$(echo "$cuda_ver" | cut -d. -f1)
     minor=$(echo "$cuda_ver" | cut -d. -f2)
 
-    # Check GPU compute capability — Blackwell (sm_12x) requires nightly + cu128
+    # Check GPU compute capability — Blackwell (sm_12x) requires cu130 or nightly
     local sm_major=0
-    sm_major=$(python - 2>/dev/null <<'PYEOF'
-import subprocess, re, sys
-try:
-    out = subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-        text=True).strip().split("\n")[0]
-    print(out.split(".")[0])
-except Exception:
-    print("0")
-PYEOF
-)
+    sm_major=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+               | head -1 | cut -d. -f1 || echo "0")
 
     if [[ "$sm_major" -ge 12 ]]; then
-        # DGX Spark GB10 (sm_121, CUDA 13) needs cu130; desktop Blackwell (CUDA 12.8) uses nightly cu128
+        # DGX Spark GB10 (sm_121, CUDA 13) uses stable cu130
+        # Desktop Blackwell (CUDA 12.8) uses nightly cu128
         if [[ "$major" -ge 13 ]]; then
             echo "https://download.pytorch.org/whl/cu130"; return
         fi
@@ -109,72 +71,93 @@ PYEOF
     fi
 }
 
-# ── Install Python packages ──────────────────────────────────────────────────
-echo "==> Installing Python packages ..."
-pip install -q --upgrade pip
-
-TORCH_INDEX_RAW="$(detect_torch_index_url)"
-echo "==> Detected PyTorch index: $TORCH_INDEX_RAW"
-if [[ "$TORCH_INDEX_RAW" == nightly:* ]]; then
-    TORCH_INDEX="${TORCH_INDEX_RAW#nightly:}"
-    TORCH_NIGHTLY=1
-else
-    TORCH_INDEX="$TORCH_INDEX_RAW"
-    TORCH_NIGHTLY=0
+# ── Create venv (once) ───────────────────────────────────────────────────────
+if [[ ! -d "$VENV_DIR" ]]; then
+    echo "==> Creating uv environment (Python ${PYTHON_VERSION}) ..."
+    uv python install "$PYTHON_VERSION"
+    uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
+    echo "==> Environment created at $VENV_DIR"
 fi
 
-install_cuda_torch() {
-    if [[ "$TORCH_NIGHTLY" -eq 1 ]]; then
-        pip install -q --pre torch --upgrade --index-url "$TORCH_INDEX"
+# ── Activate ─────────────────────────────────────────────────────────────────
+# shellcheck source=/dev/null
+source "$VENV_DIR/bin/activate"
+
+# ── Install nemo-automodel if needed ────────────────────────────────────────
+if [[ "$BACKEND" == "nemo" ]] && ! python -c "import nemo_automodel" 2>/dev/null; then
+    echo "==> Installing nemo-automodel ..."
+    uv pip install nemo-automodel
+fi
+
+# ── Ensure CUDA-enabled PyTorch is installed ─────────────────────────────────
+TORCH_CUDA_OK=$(python -c "import torch; print('1' if torch.cuda.is_available() else '0')" 2>/dev/null || echo "0")
+if [[ "$TORCH_CUDA_OK" != "1" ]]; then
+    TORCH_INDEX_RAW="$(detect_torch_index_url)"
+    echo "==> Installing CUDA-enabled PyTorch (index: ${TORCH_INDEX_RAW#nightly:}) ..."
+    if [[ "$TORCH_INDEX_RAW" == nightly:* ]]; then
+        uv pip install --reinstall --pre torch --index-url "${TORCH_INDEX_RAW#nightly:}"
     else
-        pip install -q torch --upgrade --index-url "$TORCH_INDEX"
+        uv pip install --reinstall "torch==2.10.0" --index-url "$TORCH_INDEX_RAW"
     fi
+fi
+
+# ── Symlink libcuda.so.1 into Triton's lib dir (idempotent, no sudo needed) ──
+# Triton compiles a small C helper at startup and links against libcuda.so.1.
+# It searches its own lib dir + /lib/<arch>-linux-gnu, but on many distros the
+# file lives elsewhere. We symlink it into the venv (which we own) so Triton
+# can always find it without any system-level changes.
+find_libcuda() {
+    # 1. ldconfig is the authoritative source on Linux
+    if command -v ldconfig &>/dev/null; then
+        local loc
+        loc=$(ldconfig -p 2>/dev/null | awk '/libcuda\.so\.1/{print $NF}' | head -1)
+        [[ -n "$loc" && -e "$loc" ]] && { echo "$loc"; return; }
+    fi
+    # 2. LD_LIBRARY_PATH
+    IFS=: read -ra _ld_dirs <<< "${LD_LIBRARY_PATH:-}"
+    for d in "${_ld_dirs[@]}"; do
+        [[ -e "$d/libcuda.so.1" ]] && { echo "$d/libcuda.so.1"; return; }
+    done
+    # 3. Broad search across common locations (no sudo needed — just reading)
+    find /usr/lib /lib /usr/local/cuda /usr/local/lib /opt \
+         -name "libcuda.so.1" 2>/dev/null | head -1 || true
 }
 
-if [[ "$BACKEND" == "nemo" ]]; then
-    echo "==> Installing nemo-automodel ..."
-    pip install -q nemo-automodel
-    # nemo-automodel 0.3.0 metadata incorrectly pins torch<=2.10.0 but
-    # requires >=2.11.0 at runtime. Upgrade torch with its full dep tree
-    # (so nvidia-cudnn and friends are present). pip's resolver may remove
-    # nemo-automodel as a side effect of the version conflict — reinstall
-    # it with --no-deps afterwards to put the files back without re-adding
-    # the broken torch pin.
-    echo "==> Installing CUDA-enabled PyTorch (nemo requires >=2.11.0 at runtime) ..."
-    install_cuda_torch
-    if ! python -c "import nemo_automodel" 2>/dev/null; then
-        echo "==> Reinstalling nemo-automodel files (removed by pip resolver during torch upgrade) ..."
-        pip install -q nemo-automodel --no-deps
+TRITON_LIB="$VENV_DIR/lib/python${PYTHON_VERSION}/site-packages/triton/backends/nvidia/lib"
+if [[ -d "$TRITON_LIB" && ! -e "$TRITON_LIB/libcuda.so.1" ]]; then
+    LIBCUDA="$(find_libcuda)"
+    if [[ -n "$LIBCUDA" ]]; then
+        ln -sf "$LIBCUDA" "$TRITON_LIB/libcuda.so.1"
+        echo "==> Linked $LIBCUDA -> $TRITON_LIB/libcuda.so.1"
+    else
+        echo "WARNING: libcuda.so.1 not found — Triton kernel compilation may fail." >&2
     fi
-else
-    install_cuda_torch
 fi
 
-# Verify CUDA is accessible after install
+# ── Install remaining Python deps ────────────────────────────────────────────
+uv pip install -q transformers peft datasets accelerate trl matplotlib pandas numpy
+
+# ── Verify CUDA is accessible ────────────────────────────────────────────────
 if ! python - <<'EOF'
 import torch, sys
 if torch.cuda.is_available():
     print(f"==> PyTorch {torch.__version__}, CUDA {torch.version.cuda}, device: {torch.cuda.get_device_name(0)}")
     sys.exit(0)
 else:
-    print("ERROR: torch.cuda.is_available() is False after install.", file=sys.stderr)
-    print(f"       torch version: {torch.__version__}, CUDA build: {torch.version.cuda}", file=sys.stderr)
+    print("ERROR: torch.cuda.is_available() is False.", file=sys.stderr)
+    print(f"       torch: {torch.__version__}, CUDA build: {torch.version.cuda}", file=sys.stderr)
     sys.exit(1)
 EOF
 then
     echo ""
-    echo "HINT: The installed PyTorch may not match your CUDA version."
+    echo "HINT: Delete .venv/ and rerun — the environment will be rebuilt with CUDA PyTorch."
     echo "      Driver CUDA: $(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[0-9.]+' | head -1)"
-    echo "      Try running the script again — the index URL selection may need adjustment."
     exit 1
 fi
 
-pip install -q transformers peft datasets accelerate trl \
-               matplotlib pandas numpy
-
 # ── Run benchmark ────────────────────────────────────────────────────────────
 echo ""
-echo "==> Running benchmark (machine: '${MACHINE_LABEL}') ..."
+echo "==> Running benchmark (machine: '${MACHINE_LABEL}', backend: '${BACKEND}') ..."
 echo ""
 
 cd "$SCRIPT_DIR"

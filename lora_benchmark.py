@@ -75,6 +75,14 @@ def parse_args():
     p.add_argument("--backend", default="hf", choices=["hf", "nemo"],
                    help="Training backend: 'hf' (HuggingFace+PEFT, default) or "
                         "'nemo' (NeMo AutoModel + native LoRA)")
+    p.add_argument("--gradient-checkpointing", action="store_true",
+                   help="Enable gradient checkpointing in both backends (saves VRAM, "
+                        "adds ~20-30%% recompute overhead). Off by default so both "
+                        "backends are on equal footing.")
+    p.add_argument("--attn-impl", default="sdpa", choices=["sdpa", "flash_attention_2"],
+                   help="Attention implementation for both backends (default: sdpa). "
+                        "Use flash_attention_2 only if both backends support it on "
+                        "your hardware.")
     return p.parse_args()
 
 
@@ -209,12 +217,7 @@ def load_model(args, info: dict, devices: list):
     tokenizer.padding_side = "right"
 
     is_unified = torch.cuda.get_device_properties(devices[0]).is_integrated
-
-    try:
-        import flash_attn  # noqa
-        _attn_impl = "sdpa" if is_unified else "flash_attention_2"
-    except ImportError:
-        _attn_impl = "sdpa"
+    _attn_impl = args.attn_impl
 
     if args.shard_model and len(devices) > 1 and not is_unified:
         # Model sharding: distribute layers across GPUs via device_map="auto".
@@ -254,10 +257,10 @@ def load_model(args, info: dict, devices: list):
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_cfg)
-    # Recompute activations during backward instead of storing them all.
     # enable_input_require_grads() is required because PEFT freezes base weights.
     model.enable_input_require_grads()
-    model.gradient_checkpointing_enable()
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
     if is_main:
         model.print_trainable_parameters()
 
@@ -271,14 +274,14 @@ def load_model(args, info: dict, devices: list):
 
 def load_model_nemo(args, info: dict, devices: list):
     try:
-        from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoTokenizer
+        from nemo_automodel import NeMoAutoModelForCausalLM
+        from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
     except ImportError as e:
         raise SystemExit(
             "[ERROR] --backend nemo requires: pip install nemo-automodel\n"
             f"  {e}"
         )
-    from peft import LoraConfig, get_peft_model
-    from torch.nn.parallel import DistributedDataParallel as DDP
+    from transformers import AutoTokenizer
 
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     ddp = local_rank != -1
@@ -290,49 +293,41 @@ def load_model_nemo(args, info: dict, devices: list):
     if is_main:
         print(f"[nemo] Loading {args.model_id} via NeMoAutoModelForCausalLM ...")
 
-    tokenizer = NeMoAutoTokenizer.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         args.model_id, token=args.hf_token, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    if ddp:
-        device_map = {"": f"cuda:{local_rank}"}
-    else:
-        device_map = {"": devices[0]}
+    device_map = {"": f"cuda:{local_rank}"} if ddp else {"": devices[0]}
 
-    # NeMoAutoModelForCausalLM is a drop-in for HF's AutoModelForCausalLM,
-    # so PEFT LoRA applies to it directly.
     model = NeMoAutoModelForCausalLM.from_pretrained(
         args.model_id,
         torch_dtype=torch_dtype,
         device_map=device_map,
         token=args.hf_token,
         trust_remote_code=True,
+        attn_implementation=args.attn_impl,
     )
     model.config.use_cache = False
 
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                      "gate_proj", "up_proj", "down_proj"]
-    lora_cfg = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=target_modules,
-        bias="none",
-        task_type="CAUSAL_LM",
+    # NeMo native LoRA — same 7 projection layers as the HF backend.
+    # PeftConfig uses wildcard patterns; dim/alpha map directly to lora_rank/lora_alpha.
+    peft_cfg = PeftConfig(
+        target_modules=[".*q_proj", ".*k_proj", ".*v_proj", ".*o_proj",
+                        ".*gate_proj", ".*up_proj", ".*down_proj"],
+        dim=args.lora_rank,
+        alpha=args.lora_alpha,
+        dropout=args.lora_dropout,
     )
-    model = get_peft_model(model, lora_cfg)
-    model.enable_input_require_grads()
-    model.gradient_checkpointing_enable()
+    apply_lora_to_linear_modules(model, peft_cfg)
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
 
     if is_main:
-        model.print_trainable_parameters()
-
-    if ddp:
-        model = DDP(model, device_ids=[local_rank])
-        if is_main:
-            print(f"[nemo] DDP enabled: {dist.get_world_size()} GPU(s)")
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in model.parameters())
+        print(f"[nemo] Trainable params: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
     return model, tokenizer
 
@@ -483,12 +478,16 @@ def run_benchmark(args, model, dataset, devices: list):
 
 
 def run_benchmark_nemo(args, model, dataset, devices: list):
-    """Same benchmark loop as run_benchmark() but with defensive loss extraction
-    for NeMo AutoModel, which may return outputs as a dict or tuple rather than
-    a CausalLMOutput object with a .loss attribute."""
+    """Benchmark loop for NeMo native LoRA.
+
+    Forward pass returns logits; loss is computed separately via MaskedCrossEntropy
+    to match NeMo's own training recipe. Everything else (timing, grad accumulation,
+    optimizer, sampling) is identical to run_benchmark() for fair comparison.
+    """
     from torch.utils.data import DataLoader, DistributedSampler
     from torch.optim import AdamW
     from transformers import get_linear_schedule_with_warmup
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     ddp = local_rank != -1
@@ -511,6 +510,7 @@ def run_benchmark_nemo(args, model, dataset, devices: list):
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps)
 
+    loss_fn   = MaskedCrossEntropy()
     param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
 
     model.train()
@@ -538,18 +538,10 @@ def run_benchmark_nemo(args, model, dataset, devices: list):
         attention_mask = batch["attention_mask"].to(device)
         labels         = batch["labels"].to(device)
 
-        t0  = time.perf_counter()
-        raw = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-
-        # Defensive loss extraction: handle CausalLMOutput, dict, and tuple
-        if hasattr(raw, "loss"):
-            loss_val = raw.loss
-        elif isinstance(raw, dict):
-            loss_val = raw["loss"]
-        else:
-            loss_val = raw[0]
-
-        loss = loss_val / args.grad_accum
+        t0      = time.perf_counter()
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        loss_val = loss_fn(logits=outputs.logits, labels=labels)
+        loss     = loss_val / args.grad_accum
         loss.backward()
 
         if (step + 1) % args.grad_accum == 0:
@@ -584,7 +576,7 @@ def run_benchmark_nemo(args, model, dataset, devices: list):
     if gpu_sampler is not None:
         gpu_sampler.stop()
     if bench_start is None:
-        raise SystemExit("[ERROR] NeMo benchmark never started - warmup_steps exceeds the number of available batches.")
+        raise SystemExit("[ERROR] NeMo benchmark never started — warmup_steps exceeds available batches.")
     bench_wall = time.perf_counter() - bench_start
     if is_main:
         print("-" * 60)
@@ -705,7 +697,10 @@ def save_json(args, info: dict, metrics: dict):
     fname = f"results_{safe_label}.json"
     results = {
         "timestamp":       datetime.datetime.now().isoformat(),
-        "backend":         args.backend,
+        "backend":              args.backend,
+        "lora_impl":            "nemo_native" if args.backend == "nemo" else "peft",
+        "attn_impl":            args.attn_impl,
+        "gradient_checkpointing": args.gradient_checkpointing,
         "machine":         args.machine_label,
         "model":           args.model_id,
         "gpu":             info["gpu"],
